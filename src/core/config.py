@@ -120,6 +120,8 @@ def blue_client_kwargs() -> dict:
             os.environ.get("OPENROUTER_BASE_URL", OPENROUTER_BASE_URL).strip()
             or OPENROUTER_BASE_URL
         ),
+        "timeout": 45.0,  # model free hay treo/504 — không chờ mặc định 10 phút
+        "max_retries": 0,  # pipeline tự retry có backoff
     }
 
 
@@ -149,10 +151,14 @@ def get_red_model() -> str:
             os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip()
             or DEFAULT_GEMINI_MODEL
         )
-    return (
+    model = (
         os.environ.get("OPENAI_MODEL", DEFAULT_OPENAI_MODEL).strip()
         or DEFAULT_OPENAI_MODEL
     )
+    # OpenRouter yêu cầu slug có tiền tố nhà cung cấp: openai/gpt-4o-mini
+    if red_via_openrouter() and "/" not in model:
+        model = f"openai/{model}"
+    return model
 
 
 def get_red_model_default() -> str:
@@ -165,12 +171,25 @@ def get_red_model_advance() -> str:
     return get_red_model()
 
 
+def red_via_openrouter() -> bool:
+    """Red (openai path) gọi qua OpenRouter khi RED_VIA_OPENROUTER != 0 (mặc định: bật)."""
+    return os.environ.get("RED_VIA_OPENROUTER", "1").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
 def get_openai_api_key() -> str:
+    """Key của Red (openai path): OpenRouter key nếu đi qua OpenRouter."""
+    if red_via_openrouter():
+        return get_openrouter_api_key()
     return os.environ.get("OPENAI_API_KEY", "").strip()
 
 
 def red_openai_client_kwargs() -> dict:
-    return {"api_key": get_openai_api_key() or None}
+    kwargs: dict = {"api_key": get_openai_api_key() or None}
+    if red_via_openrouter():
+        kwargs["base_url"] = blue_client_kwargs()["base_url"]
+    return kwargs
 
 
 def red_provider_label(tier: str = "advance") -> str:
@@ -216,7 +235,7 @@ def provider_label() -> str:
 
 def is_harder_model() -> bool:
     """True nếu .env đang trỏ model khó (luna / 3.8) — tuỳ chọn, không phải tên agent."""
-    m = get_red_model().lower()
+    m = get_red_model().lower().split("/")[-1]
     if m in {DEFAULT_OPENAI_MODEL.lower(), DEFAULT_GEMINI_MODEL.lower()}:
         return False
     hard = {
@@ -252,7 +271,8 @@ def setup_api_key():
     else:
         if not get_openai_api_key():
             os.environ["OPENAI_API_KEY"] = input("Enter OpenAI API Key (Red): ").strip()
-        print(f"Red / Red Advance  — openai:{model}")
+        via = "OpenRouter" if red_via_openrouter() else "OpenAI"
+        print(f"Red / Red Advance  — openai:{model}  (via {via})")
 
     print(
         "Bonus: chọn một — Red tối đa +5 (B1) hoặc Red Advance tối đa +10 (B2)."

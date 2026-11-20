@@ -237,6 +237,18 @@ def _model_entry(provider: str, model: str) -> dict:
             "api_key_env_var": "GOOGLE_API_KEY",
             "parameters": {"base_url": GEMINI_OPENAI_BASE_URL},
         }
+    from core.config import red_via_openrouter, OPENROUTER_BASE_URL
+
+    if red_via_openrouter():
+        return {
+            "type": "main",
+            "engine": "openai",
+            "model": model,
+            "api_key_env_var": "OPENROUTER_API_KEY",
+            "parameters": {
+                "base_url": os.environ.get("OPENROUTER_BASE_URL", OPENROUTER_BASE_URL)
+            },
+        }
     return {
         "type": "main",
         "engine": "openai",

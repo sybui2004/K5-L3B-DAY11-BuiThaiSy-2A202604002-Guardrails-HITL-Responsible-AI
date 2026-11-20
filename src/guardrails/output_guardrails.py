@@ -27,6 +27,34 @@ from core.utils import chat_with_agent
 # - "redacted": cleaned response (PII replaced with [REDACTED])
 # ============================================================
 
+WITHHELD_MESSAGE = (
+    "[REDACTED] I cannot share internal system details. "
+    "How else can I help with your VinBank account or banking needs?"
+)
+
+# Dấu hiệu model đang chép lại system prompt / ghi chú nội bộ
+PROMPT_LEAK_PATTERNS = [
+    r"internal\s+note", r"do\s+not\s+disclose", r"must\s+not\s+violate",
+    r"security\s*\(\s*must", r"you\s+are\s+a\s+helpful\s+customer\s+service\s+assistant",
+    r"my\s+(system\s+)?(prompt|instructions)\s+(is|are|say|says|state)",
+    r"\bghi\s*chu\s*noi\s*bo\b", r"\bkhong\s+duoc\s+tiet\s+lo\b",
+]
+
+
+def secret_or_prompt_leak(response: str) -> list[str]:
+    """Lý do cần chặn cứng câu trả lời (rỗng = an toàn)."""
+    from agents.security_boundary import contains_secret
+    from guardrails.secret_scan import find_secret_leaks, fold
+
+    reasons = [f"secret_leak: {r}" for r in find_secret_leaks(response)]
+    if contains_secret(response):  # cùng tiêu chí với evaluator chấm leak
+        reasons.append("secret_leak: evaluator_match")
+    folded = fold(response)
+    if any(re.search(p, folded) for p in PROMPT_LEAK_PATTERNS):
+        reasons.append("system_prompt_leak")
+    return list(dict.fromkeys(reasons))
+
+
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
@@ -41,12 +69,13 @@ def content_filter(response: str) -> dict:
 
     # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "vn_phone": r"(?<!\d)(?:\+84|0)\d{9,10}(?!\d)",
+        "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}",
+        "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
+        "api_key": r"\bsk-[a-zA-Z0-9-]{3,}",
+        "password": r"\b(?:password|passwd|mật\s*khẩu)\s*(?:is|của|:|=)?\s*[:=]?\s*[^\s,;]+",
+        "known_secret": r"\badmin123\b",
+        "db_host": r"\bdb\.vinbank\.internal(?::\d+)?",
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -54,6 +83,13 @@ def content_filter(response: str) -> dict:
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Fail-closed: secret (kể cả bị tách ký tự / base64 / hex / ngược / leet / acrostic)
+    # hoặc nội dung system prompt -> thay TOÀN BỘ câu trả lời, không redact từng phần.
+    hard = secret_or_prompt_leak(response)
+    if hard:
+        issues.extend(hard)
+        redacted = WITHHELD_MESSAGE
 
     return {
         "safe": len(issues) == 0,
@@ -172,16 +208,27 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=result["redacted"])],
+            )
+            response_text = result["redacted"]
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        text="I cannot share that response. Please ask a banking question."
+                    )],
+                )
+
+        return llm_response
 
 
 # ============================================================
